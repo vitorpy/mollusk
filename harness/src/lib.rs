@@ -460,7 +460,7 @@ use mollusk_svm_result::Compare;
 #[cfg(feature = "precompiles")]
 use solana_precompile_error::PrecompileError;
 #[cfg(feature = "invocation-inspect-callback")]
-use solana_transaction_context::InstructionAccount;
+use solana_transaction_context::instruction_accounts::InstructionAccount;
 use {
     crate::{
         account_store::AccountStore, epoch_stake::EpochStake, program::ProgramCache,
@@ -492,7 +492,7 @@ use {
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
     solana_svm_transaction::instruction::SVMInstruction,
-    solana_transaction_context::{IndexOfAccount, TransactionContext},
+    solana_transaction_context::{transaction::TransactionContext, IndexOfAccount},
     solana_transaction_error::TransactionError,
     std::{
         cell::RefCell,
@@ -896,12 +896,14 @@ impl Mollusk {
     fn create_transaction_context(
         &self,
         transaction_accounts: Vec<(Pubkey, AccountSharedData)>,
+        number_of_top_level_instructions: usize,
     ) -> TransactionContext<'_> {
         TransactionContext::new(
             transaction_accounts,
             self.sysvars.rent.clone(),
             self.compute_budget.max_instruction_stack_depth,
             self.compute_budget.max_instruction_trace_length,
+            number_of_top_level_instructions,
         )
     }
 
@@ -1110,8 +1112,8 @@ impl Mollusk {
             fallback_accounts,
         );
 
-        let mut transaction_context = self.create_transaction_context(transaction_accounts);
-        transaction_context.set_top_level_instruction_index(index);
+        let mut transaction_context = self.create_transaction_context(transaction_accounts, 1);
+        transaction_context.set_next_top_level_instruction_index(index);
 
         let message_result = self.process_transaction_message(
             &sanitized_message,
@@ -1190,7 +1192,7 @@ impl Mollusk {
             &fallback_accounts,
         );
 
-        let mut transaction_context = self.create_transaction_context(transaction_accounts);
+        let mut transaction_context = self.create_transaction_context(transaction_accounts, 1);
         let sysvar_cache = self.sysvars.setup_sysvar_cache(accounts);
 
         let message_result = self.process_transaction_message(
@@ -1338,7 +1340,10 @@ impl Mollusk {
             &fallback_accounts,
         );
 
-        let mut transaction_context = self.create_transaction_context(transaction_accounts);
+        let mut transaction_context = self.create_transaction_context(
+            transaction_accounts,
+            instructions.len(),
+        );
         let sysvar_cache = self.sysvars.setup_sysvar_cache(accounts);
 
         let message_result = self.process_transaction_message(

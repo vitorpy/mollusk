@@ -7,7 +7,9 @@ fn test_custom_register_tracing_callback() {
         solana_instruction::{AccountMeta, Instruction},
         solana_program_runtime::invoke_context::{Executable, InvokeContext, RegisterTrace},
         solana_pubkey::Pubkey,
-        solana_transaction_context::{InstructionAccount, InstructionContext},
+        solana_transaction_context::{
+            instruction::InstructionContext, instruction_accounts::InstructionAccount,
+        },
         std::{cell::RefCell, collections::HashMap, rc::Rc},
     };
 

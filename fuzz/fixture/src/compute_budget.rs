@@ -1,7 +1,8 @@
 //! Compute budget for instructions.
 //!
-//! Protobuf field names `alt_bn128_addition_cost` / `alt_bn128_multiplication_cost` are the legacy
-//! wire IDs for G1 costs; they map to `ComputeBudget::alt_bn128_g1_addition_cost` and
+//! Protobuf field names `alt_bn128_addition_cost` /
+//! `alt_bn128_multiplication_cost` are the legacy wire IDs for G1 costs; they
+//! map to `ComputeBudget::alt_bn128_g1_addition_cost` and
 //! `alt_bn128_g1_multiplication_cost`.
 
 use {
@@ -366,11 +367,7 @@ pub(crate) fn hash_proto_compute_budget(hasher: &mut Hasher, compute_budget: &Pr
     hasher.hash(&compute_budget.alt_bn128_g1_decompress.to_le_bytes());
     hasher.hash(&compute_budget.alt_bn128_g2_compress.to_le_bytes());
     hasher.hash(&compute_budget.alt_bn128_g2_decompress.to_le_bytes());
-    hasher.hash(
-        &compute_budget
-            .alt_bn128_g2_addition_cost
-            .to_le_bytes(),
-    );
+    hasher.hash(&compute_budget.alt_bn128_g2_addition_cost.to_le_bytes());
     hasher.hash(
         &compute_budget
             .alt_bn128_g2_multiplication_cost
@@ -387,9 +384,5 @@ pub(crate) fn hash_proto_compute_budget(hasher: &mut Hasher, compute_budget: &Pr
     hasher.hash(&compute_budget.bls12_381_g1_validate_cost.to_le_bytes());
     hasher.hash(&compute_budget.bls12_381_g2_validate_cost.to_le_bytes());
     hasher.hash(&compute_budget.bls12_381_one_pair_cost.to_le_bytes());
-    hasher.hash(
-        &compute_budget
-            .bls12_381_additional_pair_cost
-            .to_le_bytes(),
-    );
+    hasher.hash(&compute_budget.bls12_381_additional_pair_cost.to_le_bytes());
 }

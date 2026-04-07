@@ -1340,10 +1340,8 @@ impl Mollusk {
             &fallback_accounts,
         );
 
-        let mut transaction_context = self.create_transaction_context(
-            transaction_accounts,
-            instructions.len(),
-        );
+        let mut transaction_context =
+            self.create_transaction_context(transaction_accounts, instructions.len());
         let sysvar_cache = self.sysvars.setup_sysvar_cache(accounts);
 
         let message_result = self.process_transaction_message(

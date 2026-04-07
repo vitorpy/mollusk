@@ -14,7 +14,7 @@ pub static OMITTED_FEATURES: &[Pubkey] = &[
 impl From<ProtoFeatureSet> for FeatureSet {
     fn from(value: ProtoFeatureSet) -> Self {
         let mut feature_set = Self::default();
-        let mut inactive = std::mem::take(feature_set.inactive_mut());
+        let mut inactive = feature_set.inactive().clone();
         OMITTED_FEATURES.iter().for_each(|f| {
             inactive.remove(f);
         });
@@ -23,7 +23,7 @@ impl From<ProtoFeatureSet> for FeatureSet {
             let discriminator = int_id.to_le_bytes();
             let feature_id = inactive
                 .iter()
-                .find(|feature_id| feature_id.to_bytes()[0..8].eq(&discriminator));
+                .find(|feature_id: &&Pubkey| feature_id.to_bytes()[0..8].eq(&discriminator));
             if let Some(feature_id) = feature_id {
                 feature_set.activate(feature_id, 0);
             }

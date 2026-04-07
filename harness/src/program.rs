@@ -2,15 +2,17 @@
 
 use {
     agave_feature_set::FeatureSet,
-    agave_syscalls::create_program_runtime_environment_v1,
+    agave_syscalls::create_program_runtime_environment,
     solana_account::Account,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_loader_v3_interface::state::UpgradeableLoaderState,
     solana_loader_v4_interface::state::{LoaderV4State, LoaderV4Status},
     solana_program_runtime::{
-        invoke_context::{BuiltinFunctionWithContext, InvokeContext},
-        loaded_programs::{LoadProgramMetrics, ProgramCacheEntry, ProgramCacheForTxBatch},
-        solana_sbpf::program::BuiltinProgram,
+        invoke_context::BuiltinFunctionRegisterer,
+        loaded_programs::{ProgramCacheForTxBatch, ProgramRuntimeEnvironment},
+        program_cache_entry::ProgramCacheEntry,
+        program_metrics::LoadProgramMetrics,
+        solana_sbpf::program::{BuiltinFunctionDefinition, BuiltinProgram},
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
@@ -75,7 +77,7 @@ pub struct ProgramCache {
     entries_cache: Rc<RefCell<HashMap<Pubkey, CacheEntry>>>,
     // The function registry (syscalls) to use for verifying and loading
     // program ELFs.
-    pub program_runtime_environment: BuiltinProgram<InvokeContext<'static, 'static>>,
+    pub program_runtime_environment: ProgramRuntimeEnvironment,
 }
 
 impl ProgramCache {
@@ -84,11 +86,12 @@ impl ProgramCache {
         compute_budget: &ComputeBudget,
         enable_register_tracing: bool,
     ) -> Self {
+        let runtime_features = feature_set.runtime_features();
         let me = Self {
             cache: Rc::new(RefCell::new(ProgramCacheForTxBatch::default())),
             entries_cache: Rc::new(RefCell::new(HashMap::new())),
-            program_runtime_environment: create_program_runtime_environment_v1(
-                &feature_set.runtime_features(),
+            program_runtime_environment: create_program_runtime_environment(
+                &runtime_features,
                 &compute_budget.to_budget(),
                 /* reject_deployment_of_broken_elfs */ false,
                 /* debugging_features */ enable_register_tracing,
@@ -130,6 +133,31 @@ impl ProgramCache {
         self.replenish(program_id, entry, None);
     }
 
+    /// Register a custom syscall in the program runtime environment used for
+    /// program verification and loading.
+    pub fn register_function(
+        &mut self,
+        name: &str,
+        register_fn: BuiltinFunctionRegisterer,
+    ) -> Result<(), solana_program_runtime::solana_sbpf::elf::ElfError> {
+        let config = self.program_runtime_environment.get_config().clone();
+        let mut loader = BuiltinProgram::new_loader(config);
+
+        for (_key, (existing_name, value)) in self
+            .program_runtime_environment
+            .get_function_registry()
+            .iter()
+        {
+            let existing_name = std::str::from_utf8(existing_name).unwrap();
+            loader.register_function(existing_name, value)?;
+        }
+
+        register_fn(&mut loader, name)?;
+        self.program_runtime_environment = ProgramRuntimeEnvironment::from(loader);
+
+        Ok(())
+    }
+
     /// Add a program to the cache.
     pub fn add_program(&mut self, program_id: &Pubkey, loader_key: &Pubkey, elf: &[u8]) {
         // This might look rough, but it's actually functionally the same as
@@ -147,7 +175,7 @@ impl ProgramCache {
                 loader.register_function(name, value).unwrap();
             }
 
-            Arc::new(loader)
+            ProgramRuntimeEnvironment::from(loader)
         };
         self.replenish(
             *program_id,
@@ -223,7 +251,7 @@ impl ProgramCache {
 pub struct Builtin {
     pub program_id: Pubkey,
     pub name: &'static str,
-    pub entrypoint: BuiltinFunctionWithContext,
+    pub entrypoint: BuiltinFunctionRegisterer,
 }
 
 impl Builtin {
@@ -240,47 +268,47 @@ static BUILTINS: &[Builtin] = &[
     Builtin {
         program_id: solana_system_program::id(),
         name: "system_program",
-        entrypoint: solana_system_program::system_processor::Entrypoint::vm,
+        entrypoint: solana_system_program::system_processor::Entrypoint::register,
     },
     Builtin {
         program_id: loader_keys::LOADER_V2,
         name: "solana_bpf_loader_program",
-        entrypoint: solana_bpf_loader_program::Entrypoint::vm,
+        entrypoint: solana_bpf_loader_program::Entrypoint::register,
     },
     Builtin {
         program_id: loader_keys::LOADER_V3,
         name: "solana_bpf_loader_upgradeable_program",
-        entrypoint: solana_bpf_loader_program::Entrypoint::vm,
+        entrypoint: solana_bpf_loader_program::Entrypoint::register,
     },
     #[cfg(feature = "all-builtins")]
     Builtin {
         program_id: loader_keys::LOADER_V1,
         name: "solana_bpf_loader_deprecated_program",
-        entrypoint: solana_bpf_loader_program::Entrypoint::vm,
+        entrypoint: solana_bpf_loader_program::Entrypoint::register,
     },
     #[cfg(feature = "all-builtins")]
     Builtin {
         program_id: loader_keys::LOADER_V4,
         name: "solana_loader_v4_program",
-        entrypoint: solana_loader_v4_program::Entrypoint::vm,
+        entrypoint: solana_loader_v4_program::Entrypoint::register,
     },
     #[cfg(feature = "all-builtins")]
     Builtin {
         program_id: solana_sdk_ids::zk_elgamal_proof_program::id(),
         name: "zk_elgamal_proof_program",
-        entrypoint: solana_zk_elgamal_proof_program::Entrypoint::vm,
+        entrypoint: solana_zk_elgamal_proof_program::Entrypoint::register,
     },
     #[cfg(feature = "all-builtins")]
     Builtin {
         program_id: solana_sdk_ids::compute_budget::id(),
         name: "compute_budget_program",
-        entrypoint: solana_compute_budget_program::Entrypoint::vm,
+        entrypoint: solana_compute_budget_program::Entrypoint::register,
     },
     #[cfg(feature = "all-builtins")]
     Builtin {
         program_id: solana_sdk_ids::vote::id(),
         name: "vote_program",
-        entrypoint: solana_vote_program::vote_processor::Entrypoint::vm,
+        entrypoint: solana_vote_program::vote_processor::Entrypoint::register,
     },
 ];
 

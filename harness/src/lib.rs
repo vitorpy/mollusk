@@ -459,17 +459,13 @@ pub use mollusk_svm_result as result;
 use mollusk_svm_result::Compare;
 #[cfg(feature = "precompiles")]
 use solana_precompile_error::PrecompileError;
-#[cfg(feature = "invocation-inspect-callback")]
-use solana_transaction_context::instruction_accounts::InstructionAccount;
 use {
     crate::{
         account_store::AccountStore, epoch_stake::EpochStake, program::ProgramCache,
         sysvar::Sysvars,
     },
     agave_feature_set::FeatureSet,
-    agave_syscalls::{
-        create_program_runtime_environment_v1, create_program_runtime_environment_v2,
-    },
+    agave_syscalls::create_program_runtime_environment,
     mollusk_svm_error::error::{MolluskError, MolluskPanic},
     mollusk_svm_result::{
         types::{TransactionProgramResult, TransactionResult},
@@ -477,29 +473,29 @@ use {
     },
     solana_account::{Account, AccountSharedData, ReadableAccount},
     solana_compute_budget::compute_budget::ComputeBudget,
-    solana_hash::Hash,
     solana_instruction::{AccountMeta, Instruction},
     solana_instruction_error::InstructionError,
     solana_message::SanitizedMessage,
     solana_program_error::ProgramError,
     solana_program_runtime::{
         invoke_context::{EnvironmentConfig, InvokeContext},
-        loaded_programs::ProgramRuntimeEnvironments,
+        loaded_programs::{ProgramRuntimeEnvironment, ProgramRuntimeEnvironments},
         sysvar_cache::SysvarCache,
     },
     solana_pubkey::Pubkey,
     solana_svm_callback::InvokeContextCallback,
     solana_svm_log_collector::LogCollector,
     solana_svm_timings::ExecuteTimings,
-    solana_svm_transaction::instruction::SVMInstruction,
-    solana_transaction_context::{transaction::TransactionContext, IndexOfAccount},
+    solana_transaction_context::{
+        instruction_accounts::InstructionAccount, transaction::TransactionContext,
+        IndexOfAccount, MAX_ACCOUNTS_PER_TRANSACTION,
+    },
     solana_transaction_error::TransactionError,
     std::{
         cell::RefCell,
         collections::{HashMap, HashSet},
         iter::once,
         rc::Rc,
-        sync::Arc,
     },
 };
 #[cfg(feature = "inner-instructions")]
@@ -716,20 +712,18 @@ impl Mollusk {
              solana_runtime::message_processor=debug,\
              solana_runtime::system_instruction_processor=trace",
         );
-        let compute_budget = ComputeBudget::new_with_defaults(true, true);
-
         #[cfg(feature = "fuzz")]
         let feature_set = {
             // Omit "test features" (they have the same u64 ID).
             let mut fs = FeatureSet::all_enabled();
-            fs.active_mut()
-                .remove(&agave_feature_set::disable_sbpf_v0_execution::id());
-            fs.active_mut()
-                .remove(&agave_feature_set::reenable_sbpf_v0_execution::id());
+            fs.deactivate(&agave_feature_set::disable_sbpf_v0_execution::id());
+            fs.deactivate(&agave_feature_set::reenable_sbpf_v0_execution::id());
             fs
         };
         #[cfg(not(feature = "fuzz"))]
         let feature_set = FeatureSet::all_enabled();
+        let compute_budget =
+            ComputeBudget::new_with_defaults(feature_set.runtime_features().raise_cpi_nesting_limit_to_8);
 
         let program_cache =
             ProgramCache::new(&feature_set, &compute_budget, enable_register_tracing);
@@ -911,10 +905,12 @@ impl Mollusk {
     fn deconstruct_inner_instructions(
         transaction_context: &mut TransactionContext,
     ) -> Vec<Vec<InnerInstruction>> {
-        let ix_trace = transaction_context.take_instruction_trace();
+        let (ix_trace, ix_accounts, ix_data) = transaction_context.take_instruction_trace();
         let mut all_inner_instructions: Vec<Vec<InnerInstruction>> = Vec::new();
 
-        for ix_in_trace in ix_trace {
+        for ((ix_in_trace, instruction_accounts), instruction_data) in
+            ix_trace.into_iter().zip(ix_accounts).zip(ix_data)
+        {
             let stack_height = ix_in_trace.nesting_level.saturating_add(1);
 
             if stack_height == 1 {
@@ -925,9 +921,8 @@ impl Mollusk {
                 let inner_instruction = InnerInstruction {
                     instruction: CompiledInstruction::new_from_raw_parts(
                         ix_in_trace.program_account_index_in_tx as u8,
-                        ix_in_trace.instruction_data.to_vec(),
-                        ix_in_trace
-                            .instruction_accounts
+                        instruction_data.to_vec(),
+                        instruction_accounts
                             .iter()
                             .map(|acc| acc.index_in_transaction as u8)
                             .collect(),
@@ -971,6 +966,7 @@ impl Mollusk {
         sanitized_message: &'a SanitizedMessage,
         transaction_context: &mut TransactionContext<'a>,
         sysvar_cache: &SysvarCache,
+        top_level_instruction_index_offset: usize,
     ) -> MessageResult {
         let mut compute_units_consumed = 0;
         let mut timings = ExecuteTimings::default();
@@ -987,31 +983,95 @@ impl Mollusk {
         #[cfg(feature = "register-tracing")]
         let _enable_register_tracing = self.enable_register_tracing;
 
-        let program_runtime_environments: ProgramRuntimeEnvironments = ProgramRuntimeEnvironments {
-            program_runtime_v1: Arc::new(
-                create_program_runtime_environment_v1(
-                    &runtime_features,
-                    &execution_budget,
-                    /* reject_deployment_of_broken_elfs */ false,
-                    /* debugging_features */ _enable_register_tracing,
+        let program_runtime_environment = create_program_runtime_environment(
+            &runtime_features,
+            &execution_budget,
+            /* reject_deployment_of_broken_elfs */ false,
+            /* debugging_features */ _enable_register_tracing,
+        )
+        .unwrap();
+        let program_runtime_environments = ProgramRuntimeEnvironments::new(
+            ProgramRuntimeEnvironment::clone(&program_runtime_environment),
+            program_runtime_environment,
+        );
+
+        #[expect(deprecated)]
+        let (blockhash, blockhash_lamports_per_signature) = sysvar_cache
+            .get_recent_blockhashes()
+            .ok()
+            .and_then(|x| (*x).last().cloned())
+            .map(|x| (x.blockhash, x.fee_calculator.lamports_per_signature))
+            .unwrap_or_default();
+
+        for instruction_index in 0..top_level_instruction_index_offset {
+            transaction_context
+                .configure_instruction_at_index(
+                    instruction_index,
+                    0,
+                    Vec::new(),
+                    vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION],
+                    std::borrow::Cow::Borrowed(&[]),
+                    None,
                 )
-                .unwrap(),
-            ),
-            program_runtime_v2: Arc::new(create_program_runtime_environment_v2(
-                &execution_budget,
-                /* debugging_features */ _enable_register_tracing,
-            )),
-        };
+                .expect("failed to prepare synthetic top-level instruction");
+        }
+
+        for (relative_instruction_index, (_, instruction)) in
+            sanitized_message.program_instructions_iter().enumerate()
+        {
+            let top_level_instruction_index =
+                top_level_instruction_index_offset + relative_instruction_index;
+            let mut transaction_callee_map: Vec<u16> = vec![u16::MAX; MAX_ACCOUNTS_PER_TRANSACTION];
+
+            let mut instruction_accounts: Vec<InstructionAccount> =
+                Vec::with_capacity(instruction.accounts.len());
+            for index_in_transaction in instruction.accounts.iter() {
+                let index_in_callee = transaction_callee_map
+                    .get_mut(*index_in_transaction as usize)
+                    .expect("Invalid index in transaction");
+
+                if (*index_in_callee as usize) > instruction_accounts.len() {
+                    *index_in_callee = instruction_accounts.len() as u16;
+                }
+
+                let index_in_transaction = *index_in_transaction as usize;
+                instruction_accounts.push(InstructionAccount::new(
+                    index_in_transaction as IndexOfAccount,
+                    sanitized_message.is_signer(index_in_transaction),
+                    sanitized_message.is_writable(index_in_transaction),
+                ));
+            }
+
+            transaction_context
+                .configure_instruction_at_index(
+                    top_level_instruction_index,
+                    instruction.program_id_index as u16,
+                    instruction_accounts,
+                    transaction_callee_map,
+                    std::borrow::Cow::Borrowed(&instruction.data),
+                    None,
+                )
+                .expect("failed to prepare top-level instructions");
+        }
+
+        for _ in 0..top_level_instruction_index_offset {
+            transaction_context
+                .push()
+                .expect("failed to advance top-level instruction index");
+            transaction_context
+                .pop()
+                .expect("failed to rewind synthetic top-level instruction");
+        }
 
         let mut invoke_context = InvokeContext::new(
             transaction_context,
             &mut program_cache,
             EnvironmentConfig::new(
-                Hash::default(),
-                /* blockhash_lamports_per_signature */ 5000, // The default value
+                blockhash,
+                blockhash_lamports_per_signature,
+                false,
                 &callback,
                 &runtime_features,
-                &program_runtime_environments,
                 &program_runtime_environments,
                 sysvar_cache,
             ),
@@ -1025,17 +1085,6 @@ impl Mollusk {
         for (instruction_index, (program_id, compiled_ix)) in
             sanitized_message.program_instructions_iter().enumerate()
         {
-            let program_id_index = compiled_ix.program_id_index as IndexOfAccount;
-
-            invoke_context
-                .prepare_next_top_level_instruction(
-                    sanitized_message,
-                    &SVMInstruction::from(compiled_ix),
-                    program_id_index,
-                    &compiled_ix.data,
-                )
-                .expect("failed to prepare instruction");
-
             #[cfg(feature = "invocation-inspect-callback")]
             {
                 let instruction_context = invoke_context
@@ -1112,13 +1161,15 @@ impl Mollusk {
             fallback_accounts,
         );
 
-        let mut transaction_context = self.create_transaction_context(transaction_accounts, 1);
-        transaction_context.set_next_top_level_instruction_index(index);
+        let number_of_top_level_instructions = index.saturating_add(1);
+        let mut transaction_context =
+            self.create_transaction_context(transaction_accounts, number_of_top_level_instructions);
 
         let message_result = self.process_transaction_message(
             &sanitized_message,
             &mut transaction_context,
             sysvar_cache,
+            index,
         );
 
         let resulting_accounts = if message_result.raw_result.is_ok() {
@@ -1142,7 +1193,7 @@ impl Mollusk {
             inner_instructions: message_result
                 .inner_instructions
                 .into_iter()
-                .nth(index)
+                .next()
                 .unwrap_or_default(),
             #[cfg(feature = "inner-instructions")]
             message: message_result.message,
@@ -1199,6 +1250,7 @@ impl Mollusk {
             &sanitized_message,
             &mut transaction_context,
             &sysvar_cache,
+            0,
         );
 
         let resulting_accounts = if message_result.raw_result.is_ok() {
@@ -1348,6 +1400,7 @@ impl Mollusk {
             &sanitized_message,
             &mut transaction_context,
             &sysvar_cache,
+            0,
         );
 
         let resulting_accounts = if message_result.raw_result.is_ok() {

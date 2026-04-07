@@ -45,8 +45,13 @@ fn test_custom_register_tracing_callback() {
                     )
                 })
                 .filter(|(_registers, insn)| {
-                    insn.opc & 7 == solana_program_runtime::solana_sbpf::ebpf::BPF_JMP
-                        && insn.opc != solana_program_runtime::solana_sbpf::ebpf::BPF_JA
+                    let instruction_class = insn.opc
+                        & solana_program_runtime::solana_sbpf::ebpf::BPF_CLS_MASK;
+                    (instruction_class
+                        == solana_program_runtime::solana_sbpf::ebpf::BPF_JMP64
+                        || instruction_class
+                            == solana_program_runtime::solana_sbpf::ebpf::BPF_JMP32)
+                        && insn.opc != solana_program_runtime::solana_sbpf::ebpf::JA
                 })
                 .count();
             let entry = tracing_data.entry(*program_id).or_insert(TracingData {
